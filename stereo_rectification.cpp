@@ -13,12 +13,22 @@
 #include <chrono>
 #include "camera.h"
 #include <opencv2/video/tracking.hpp>
+#include <optimization.h>
 
 using namespace std::chrono;
 using namespace std;
 using namespace cv;
 
 
+// Compute tuples of 2d points for each relevant feature.
+vector<Mat> feature_2d_prev;
+vector<Mat> feature_2d_current;
+
+// Compute tuples of 3d points for each relevant feature.
+vector<Mat> feature_3d_prev;
+vector<Mat> feature_3d_current;
+// P matrix project 3d to 2d
+Mat P;
 
 Mat unidistort_zed_image(Mat src, string cam) {
     /**
@@ -54,7 +64,7 @@ vector<Mat> compute_transformations_calibrated(Mat example) {
 
     stereoRectify(cam_l_intrisics, cam_l_distorsion, cam_r_intrisics, cam_r_distorsion, example.size(), R, T, R1, R2, P1, P2, Q);
 
-    return vector<Mat>({ R1, R2, Q });
+    return vector<Mat>({ R1, R2, Q, P1 });
 }
 
 
@@ -234,8 +244,10 @@ vector<int> get_nodes_connected_to_subgraph(Mat adjacency_matrix, vector<int> su
     for (int i = 0; i < adjacency_matrix.size().height; i++) {
         int number_of_connections = 0;
         for (int j = 0; j < subgraph.size(); j++) {
-            if (adjacency_matrix.at<uchar>(i, j) == 1) {
+            if (adjacency_matrix.at<uchar>(i, subgraph[j]) == 1 && i != subgraph[j]) {
                 number_of_connections += 1;
+            }else{
+                break;
             }
         }
         if (number_of_connections == subgraph.size()) {
@@ -264,6 +276,91 @@ int get_best_node_from_connected(Mat adjacency_matrix, vector<int> potential_nod
 
     return result;
 }
+
+bool contains_pair(vector<tuple<int,int>> vector, int i, int j){
+    bool is_present = false;
+    for (const auto &tup : vector){
+        if (get<0>(tup) == i && get<1>(tup) == j){
+            is_present = true;
+        }
+    }
+
+    return is_present;
+}
+
+vector<tuple<int,int>> get_feature_pairs_index(vector<int> subgraph_nodes){
+    vector<tuple<int,int>> feature_pairs;
+
+    for (int i = 0 ; i < subgraph_nodes.size(); i++){
+        for (int j = 0 ; j < subgraph_nodes.size(); j++){
+            if (subgraph_nodes[i] != subgraph_nodes[j] && !contains_pair(feature_pairs, subgraph_nodes[i], subgraph_nodes[j]) && !contains_pair(feature_pairs, subgraph_nodes[j], subgraph_nodes[i])){
+                feature_pairs.push_back(make_tuple(subgraph_nodes[i],subgraph_nodes[j]));
+            }
+        }
+    }
+    return feature_pairs;
+}
+
+
+vector<Mat> get_feature_pairs_2d(vector<int> feature_index, vector<Point2f> points_2d){
+    vector<Mat> pairs_2d;
+    for (const auto &pair : feature_index){
+        // initialize the first point of the 2d pair
+        int feature_1_index = pair;
+        Mat feature_1_mat = Mat(1, 4, CV_32FC1);
+        feature_1_mat.at<float>(0,0) = points_2d[feature_1_index].x;
+        feature_1_mat.at<float>(0,1) = points_2d[feature_1_index].y;
+        feature_1_mat.at<float>(0,2) = 1;
+
+    }
+    return pairs_2d;
+}
+
+vector<Mat> get_feature_pairs_3d(vector<int> feature_index, vector<Mat> points_3d){
+    vector<Mat> pairs_3d;
+    for (const auto &pair : feature_index){
+        // initialize the first point of the 2d pair
+        int feature_1_index = pair;
+        Mat feature_1_mat = points_3d[feature_1_index].clone();
+        pairs_3d.push_back(feature_1_mat);
+    }
+    return pairs_3d;
+}
+
+class Optimiz_F:public cv::MinProblemSolver::Function{
+    int getDims() const { return 2; }
+    double calc(const double* x) const {
+        Mat transform = Mat(4, 4, CV_64FC1);
+        transform.at<double>(0,0) = x[0];
+        transform.at<double>(0,1) = x[1];
+        transform.at<double>(0,2) = x[2];
+        transform.at<double>(0,3) = x[3];
+        
+        transform.at<double>(0,0) = x[4];
+        transform.at<double>(0,1) = x[5];
+        transform.at<double>(0,2) = x[6];
+        transform.at<double>(0,3) = x[7];
+        
+        transform.at<double>(0,0) = x[8];
+        transform.at<double>(0,1) = x[9];
+        transform.at<double>(0,2) = x[10];
+        transform.at<double>(0,3) = x[11];
+        
+        transform.at<double>(0,0) = 0;
+        transform.at<double>(0,1) = 0;
+        transform.at<double>(0,2) = 0;
+        transform.at<double>(0,3) = 1;
+
+        Mat test = Mat(4, 4, CV_64FC1);
+        test.setTo(5.0);
+
+        Mat result = test - transform;
+        Scalar sum_squared = sum(result) * sum(result);
+        return sum_squared[0];
+    }
+};
+
+
 
 int main() {
     // vector<Mat> images_cam_1 = get_images("C:\\Projects\\visual\\rsc\\sequences\\00\\image_2", 1);
@@ -372,7 +469,24 @@ int main() {
             int best_potential_node = get_best_node_from_connected(adjacency_matrix, connected_nodes);
             max_subgraph.push_back(best_potential_node);
         }
+
+        // Compute tuples of 2d points for each relevant feature.
+        feature_2d_prev = get_feature_pairs_2d(max_subgraph, validated_prev_points_left);
+        feature_2d_current = get_feature_pairs_2d(max_subgraph, validated_current_points_left);
+
+        // Compute tuples of 3d points for each relevant feature.
+        feature_3d_prev = get_feature_pairs_3d(max_subgraph, left_previous_keypoints_pc);
+        feature_3d_current = get_feature_pairs_3d(max_subgraph, left_matched_keypoints_pc);
+        // P matrix project 3d to 2d
+        P = stereo_transformations[3];
         
+        cv::Ptr<cv::MinProblemSolver::Function> ptr_F = cv::makePtr<Optimiz_F>();
+        Mat x = (Mat_<double>(2, 1) << 5.0, 0.0);
+        Ptr<DownhillSolver> solver = DownhillSolver::create(ptr_F,x);
+       
+        double fval = solver->minimize(x);
+        std::cout << fval << std::endl;
+
         // Create
   /*      Mat depth_keypoints;
         drawKeypoints(left_gray, detected_keypoints_left, depth_keypoints);*/
@@ -382,8 +496,8 @@ int main() {
         //line(concat, Point(Vec2i(0, 100)), Point(Vec2i(concat.size().width, 100)), Scalar(255, 0, 0), 1, LINE_8);
         //line(concat, Point(Vec2i(0, 175)), Point(Vec2i(concat.size().width, 175)), Scalar(255, 0, 0), 1, LINE_8);
         //line(concat, Point(Vec2i(0, 225)), Point(Vec2i(concat.size().width, 225)), Scalar(255, 0, 0), 1, LINE_8);
-        imshow("depth", previous_disparity_result);
-        waitKey(1);
+        // imshow("depth", previous_disparity_result);
+        // waitKey(1);
 
         // Copy the previous frame data
         previous_rectified_left = current_rectified_left.clone();

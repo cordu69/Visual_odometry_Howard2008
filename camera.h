@@ -1,7 +1,12 @@
 #pragma once
 #include "opencv2/core/core.hpp"
-using namespace cv;
+#include <vector>
+#include <string>
+#include "optimization.h"
 
+using namespace cv;
+using std::vector;
+using namespace alglib;
 double left_intrisics[3][3] = {
     {264.3375, 0, 335.41},
     {0, 264.32, 184.21375},
