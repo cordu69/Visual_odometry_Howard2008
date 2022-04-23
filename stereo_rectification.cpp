@@ -133,15 +133,35 @@ vector<Mat> compute_features_pointcloud(vector<Point2f> features, Mat disparity,
     */
 
     vector<Mat> features_pointcloud;
-    for (const auto& point : features) {
-        double d = disparity.at<ushort>(round(point.y), round(point.x));
-        Mat pixel_vector = Mat(1, 4, CV_64FC1);
-        pixel_vector.at<double>(0, 0) = double(point.x);
-        pixel_vector.at<double>(0, 1) = double(point.y);
-        pixel_vector.at<double>(0, 2) = double(d);
-        pixel_vector.at<double>(0, 3) = double(1);
-        Mat real_world_vector = pixel_vector * Q;
-        features_pointcloud.push_back(real_world_vector);
+    Mat disparity_norm;
+
+    disparity.convertTo( disparity_norm, CV_32F, 1./16);
+    cv::Mat_<cv::Vec3f> XYZ(disparity_norm.rows,disparity_norm.cols);   // Output point cloud
+    cv::Mat_<double> vec_tmp(4,1);
+    for(int y=0; y<disparity_norm.rows; ++y) {
+        for(int x=0; x<disparity_norm.cols; ++x) {
+            vec_tmp(0)=x; vec_tmp(1)=y; vec_tmp(2)=disparity_norm.at<float>(y,x); vec_tmp(3)=1;
+            vec_tmp = Q*vec_tmp;
+            vec_tmp /= vec_tmp(3);
+            cv::Vec3f &point = XYZ.at<cv::Vec3f>(y,x);
+            point[0] = vec_tmp(0);
+            point[1] = vec_tmp(1);
+            point[2] = vec_tmp(2);
+        }
+    }
+    int k = 0;
+    for(const auto &feature : features){
+        Mat _3d_feature = Mat(4, 1, CV_64FC1);
+        _3d_feature.at<double>(0, 0) = XYZ.at<Vec3f>(feature.y, feature.x)[0];
+        _3d_feature.at<double>(1, 0) = XYZ.at<Vec3f>(feature.y, feature.x)[1];
+        _3d_feature.at<double>(2, 0) = XYZ.at<Vec3f>(feature.y, feature.x)[2];
+        _3d_feature.at<double>(3, 0) = 1; 
+        // cout<<features[k]<<endl;
+        // Mat temp_3d = P * _3d_feature;
+        // Mat result = temp_3d / temp_3d.at<double>(2,0);
+        // cout<<result<<endl;
+        // k+=1;
+        features_pointcloud.push_back(_3d_feature);
     }
 
     return features_pointcloud;
@@ -304,13 +324,16 @@ vector<tuple<int,int>> get_feature_pairs_index(vector<int> subgraph_nodes){
 
 vector<Mat> get_feature_pairs_2d(vector<int> feature_index, vector<Point2f> points_2d){
     vector<Mat> pairs_2d;
+
     for (const auto &pair : feature_index){
         // initialize the first point of the 2d pair
         int feature_1_index = pair;
-        Mat feature_1_mat = Mat(1, 4, CV_32FC1);
-        feature_1_mat.at<float>(0,0) = points_2d[feature_1_index].x;
-        feature_1_mat.at<float>(0,1) = points_2d[feature_1_index].y;
-        feature_1_mat.at<float>(0,2) = 1;
+        Mat feature_1_mat = Mat(3, 1, CV_64FC1);
+        feature_1_mat.at<double>(0,0) = points_2d[feature_1_index].x;
+        feature_1_mat.at<double>(1,0) = points_2d[feature_1_index].y;
+        feature_1_mat.at<double>(2,0) = 1;
+
+        pairs_2d.push_back(feature_1_mat);
 
     }
     return pairs_2d;
@@ -328,35 +351,77 @@ vector<Mat> get_feature_pairs_3d(vector<int> feature_index, vector<Mat> points_3
 }
 
 class Optimiz_F:public cv::MinProblemSolver::Function{
-    int getDims() const { return 2; }
+    int getDims() const { return 12; }
     double calc(const double* x) const {
+        double sum = 0;
         Mat transform = Mat(4, 4, CV_64FC1);
         transform.at<double>(0,0) = x[0];
         transform.at<double>(0,1) = x[1];
         transform.at<double>(0,2) = x[2];
         transform.at<double>(0,3) = x[3];
         
-        transform.at<double>(0,0) = x[4];
-        transform.at<double>(0,1) = x[5];
-        transform.at<double>(0,2) = x[6];
-        transform.at<double>(0,3) = x[7];
+        transform.at<double>(1,0) = x[4];
+        transform.at<double>(1,1) = x[5];
+        transform.at<double>(1,2) = x[6];
+        transform.at<double>(1,3) = x[7];
         
-        transform.at<double>(0,0) = x[8];
-        transform.at<double>(0,1) = x[9];
-        transform.at<double>(0,2) = x[10];
-        transform.at<double>(0,3) = x[11];
+        transform.at<double>(2,0) = x[8];
+        transform.at<double>(2,1) = x[9];
+        transform.at<double>(2,2) = x[10];
+        transform.at<double>(2,3) = x[11];
         
-        transform.at<double>(0,0) = 0;
-        transform.at<double>(0,1) = 0;
-        transform.at<double>(0,2) = 0;
-        transform.at<double>(0,3) = 1;
+        transform.at<double>(3,0) = 0;
+        transform.at<double>(3,1) = 0;
+        transform.at<double>(3,2) = 0;
+        transform.at<double>(3,3) = 1;
 
-        Mat test = Mat(4, 4, CV_64FC1);
-        test.setTo(5.0);
+        int invalid_points = 0;
+        // cout<<transform.inv()<<endl;
+        // cout<<transform<<endl;
+        for (int i=0;i<feature_2d_prev.size();i++){
+            
+            bool valid_mat = true;
+            //cout<<temp.size()<<endl;
+            for (int j = 0 ; j < feature_3d_current.size(); j++){
+                for( int k = 0 ; k < 3 ; k ++){
+                    if(!isfinite(feature_3d_prev[j].at<double>(k,0)) || !isfinite(feature_3d_current[j].at<double>(k,0))){
+                        valid_mat = false;
+                        // cout<<feature_3d_prev[j]<<endl;
+                        // cout<<feature_3d_current[j]<<endl;
+                    }
+                }
+            }
 
-        Mat result = test - transform;
-        Scalar sum_squared = sum(result) * sum(result);
-        return sum_squared[0];
+            if(!valid_mat){
+                invalid_points +=1;
+                continue;
+            }
+            // cout<<transform.inv()<<endl;
+            Mat test = P  * transform * feature_3d_prev[i];
+            Mat test_result = test / test.at<double>(2,0);
+            Mat res = feature_2d_current[i] - test_result;
+            // cout<<res<<endl;
+            // Mat temp_result_1 = P * transform * feature_3d_current[i];
+            // Mat result_1_norm = temp_result_1 / temp_result_1.at<double>(2,0);
+            // Mat approx_1= feature_2d_prev[i] - result_1_norm;
+
+            // Mat temp_result_2 = P * transform.inv() * feature_3d_prev[i];
+            // Mat result_2_norm = temp_result_2 / temp_result_2.at<double>(2,0);
+            // Mat approx_2 = feature_2d_current[i] - result_2_norm;
+            
+            // cout<<"ceva"<<endl;
+            // cout<<feature_3d_prev[i]<<endl;
+            // cout<<approx_1<<endl;
+            // cout<<temp_result_2<<endl;
+            // cout<<approx_1<<endl;
+            // cout<<approx_2<<endl;
+            // cout<<endl;
+            //cout<<P * feature_3d_current[i].t()<<endl;
+            sum += norm(res, NORM_L2, noArray());
+        }
+       // cout<<sum<<endl;
+       //cout<<"Invalid points : "<<invalid_points<<"  "<<feature_3d_current.size()<<endl;
+        return sum;
     }
 };
 
@@ -386,6 +451,8 @@ int main() {
     tuple<Mat, Mat> undistorted_images = compute_undistorted_images(cap);
     // Get the stereo rectification transformations.
     vector<Mat> stereo_transformations = compute_transformations_calibrated(get<0>(undistorted_images));
+    // P matrix project 3d to 2d
+    P = stereo_transformations[3];
     // Compute the rectified images given the stereo transformation
     tuple<Mat, Mat> rectified_images = compute_rectified_images(get<0>(undistorted_images), get<1>(undistorted_images), stereo_transformations[0], stereo_transformations[1]);
     // Get the rectified images from the tuple object.
@@ -469,7 +536,7 @@ int main() {
             int best_potential_node = get_best_node_from_connected(adjacency_matrix, connected_nodes);
             max_subgraph.push_back(best_potential_node);
         }
-
+        if(max_subgraph.size() >= 8) {
         // Compute tuples of 2d points for each relevant feature.
         feature_2d_prev = get_feature_pairs_2d(max_subgraph, validated_prev_points_left);
         feature_2d_current = get_feature_pairs_2d(max_subgraph, validated_current_points_left);
@@ -477,16 +544,15 @@ int main() {
         // Compute tuples of 3d points for each relevant feature.
         feature_3d_prev = get_feature_pairs_3d(max_subgraph, left_previous_keypoints_pc);
         feature_3d_current = get_feature_pairs_3d(max_subgraph, left_matched_keypoints_pc);
-        // P matrix project 3d to 2d
-        P = stereo_transformations[3];
+
         
         cv::Ptr<cv::MinProblemSolver::Function> ptr_F = cv::makePtr<Optimiz_F>();
-        Mat x = (Mat_<double>(2, 1) << 5.0, 0.0);
-        Ptr<DownhillSolver> solver = DownhillSolver::create(ptr_F,x);
-       
+        Mat x = (Mat_<double>(12, 1) << 0.001, 0.001,  1.0 , 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0, 0.0);
+        Ptr<DownhillSolver> solver = DownhillSolver::create(ptr_F,x, TermCriteria(TermCriteria::MAX_ITER+TermCriteria::EPS, 15000, 0.0001));
         double fval = solver->minimize(x);
+        if (fval != 0){
         std::cout << fval << std::endl;
-
+        }
         // Create
   /*      Mat depth_keypoints;
         drawKeypoints(left_gray, detected_keypoints_left, depth_keypoints);*/
@@ -498,7 +564,9 @@ int main() {
         //line(concat, Point(Vec2i(0, 225)), Point(Vec2i(concat.size().width, 225)), Scalar(255, 0, 0), 1, LINE_8);
         // imshow("depth", previous_disparity_result);
         // waitKey(1);
-
+        }else{
+            cout<<"navem puncte"<<endl;
+        }
         // Copy the previous frame data
         previous_rectified_left = current_rectified_left.clone();
         previous_rectified_right = current_rectified_right.clone();
